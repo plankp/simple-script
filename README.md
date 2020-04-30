@@ -23,3 +23,5 @@ let's say you want to compile `./sample/test.expr`, then you'd do:
 ```
 
 and it will spit the assembler code out!
+
+***DISCLAIMER: The code generated is absolutely terrible***
