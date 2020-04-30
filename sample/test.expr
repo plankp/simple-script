@@ -1,0 +1,14 @@
+field := 1;
+
+main() := {
+    (1 + 2 * 3) - (4 * 5 + 6) * (5 \mod 7); # legal
+    a := 10;                                # legal
+    b := a;                                 # legal
+    b += 1;                                 # legal
+
+    10 \if a \else 100;                     # legal
+};
+
+sum x, y := x + y;
+
+access_field() := ::sum ::field, 10;

@@ -1,0 +1,26 @@
+plugins {
+    id 'java'
+    id 'antlr'
+    id 'application'
+}
+
+sourceCompatibility = 8
+targetCompatibility = 8
+
+repositories {
+    jcenter()
+}
+
+dependencies {
+    antlr "org.antlr:antlr4:4.8"
+    implementation 'com.google.guava:guava:28.2-jre'
+    testImplementation 'junit:junit:4.12'
+}
+
+application {
+    mainClassName = 'com.ymcmp.lang.sscr.App'
+}
+
+generateGrammarSource {
+    arguments += ['-visitor', '-no-listener']
+}
