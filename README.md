@@ -10,8 +10,8 @@ Syntax is inspired by Algol 68 (I did *not* add the `fi`s and the `od`s)
 
 There are two (and a half?) parts to this:
 1. The compiler, you need jdk 8+. This will convert the source code into IR.
-2. The IR converter, you need perl5. This will convert the IR into x86-64 NASM code (SysV calling convention).
-3. NASM if you want to assemble the code emitted by the IR converter.
+2. The IR converter, you need perl5. This will convert the IR into x86-64 code (SysV calling convention).
+3. NASM or GAS if you want to assemble the code emitted by the IR converter.
 
 How to run this?
 
@@ -21,6 +21,9 @@ let's say you want to compile `./sample/test.expr`, then you'd do:
 ```
 ./build/distributions/simple-script/bin/simple-script ./sample/test.expr | ./scripts/kill_temp.pl | ./scripts/assembler.pl
 ```
+
+This will give you `NASM` assembler code.
+Doing `./scripts/assembler.pl GAS` will give `GAS` assembler code instead.
 
 and it will spit the assembler code out!
 
