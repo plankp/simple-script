@@ -40,6 +40,109 @@ my $nextvar = 0;
 my %lblmap = ();
 my $nextlbl = 0;
 
+my $format = lc(shift || "nasm");
+
+# Each argument is a line
+sub emit_line {
+    foreach my $line (@_) {
+        if ($usebuf) {
+            push @buffer, "$line";
+        } else {
+            print "$line\n";
+        }
+    }
+}
+
+# Each argument is a line of comment
+sub emit_comment {
+    foreach my $line (@_) {
+        if ($format eq "nasm") {
+            emit_line "; $line";
+        } elsif ($format eq "gas") {
+            emit_line "# $line";
+        } else {
+            die "Unsupported output format: $format\n";
+        }
+    }
+}
+
+# $_[0] = Width (8, 16, 32, 64)
+# $_[1] = Data
+sub emit_data {
+    my $width = $_[0];
+    my %map = ();
+
+    if ($format eq "nasm") {
+        %map = (8 => "db", 16 => "dw", 32 => "dd", 64 => "dq");
+    } elsif ($format eq "gas") {
+        %map = (8 => ".byte", 16 => ".word", 32 => ".long", 64 => ".quad");
+    } else {
+        die "Unsupported output format: $format\n";
+    }
+
+    die "Unsupported output width: $width\n" unless exists $map{$width};
+    emit_line "  " . $map{$width} . " " . $_[1];
+}
+
+# $_[0] = Mnemonic
+# Rest are operands (in dst src order)
+sub emit_instr {
+    my $mnemonic = shift @_;
+    my $count = @_;
+    if ($count == 2 and $format eq "gas") {
+        # sub rbp, 10  ==>  sub 10, rbp
+        my $tmp = $_[0];
+        $_[0] = $_[1];
+        $_[1] = $tmp;
+    }
+    emit_line "  $mnemonic " . (join ", ", @_);
+}
+
+# $_[0] = Register
+sub wrap_reg {
+    my $reg = $_[0];
+    $format eq "gas" ? "\%$reg" : $reg;
+}
+
+# $_[0] = Immediate
+sub wrap_imm {
+    my $imm = $_[0];
+    return $imm if $format eq "nasm";
+    return "\$$imm" if $format eq "gas";
+
+    die "Unsupported output format: $format\n";
+}
+
+# $_[0] = Base
+# $_[1] = Offset
+sub wrap_mem {
+    my ($base, $offset) = @_;
+
+    if ($format eq "nasm") {
+        return "[$base]" if $offset == 0;
+        return "[$base + $offset]" if $offset > 0;
+
+        $offset = -$offset;
+        return "[$base - $offset]";
+    } elsif ($format eq "gas") {
+        return "($base)" if $offset == 0;
+        return "$offset($base)";
+    } else {
+        die "Unsupported output format: $format\n";
+    }
+}
+
+# $_[0] = Base
+sub wrap_rel {
+    my $base = $_[0];
+    return "[rel $base]" if $format eq "nasm";
+    return "$base(\%rip)" if $format eq "gas";
+
+    die "Unsupported output format: $format\n";
+}
+
+print emit_comment "Output format: $format assembler";
+
 while (<>) {
     chomp;
     s/^\s+|\s+$//g;
@@ -56,11 +159,7 @@ while (<>) {
             $lbl = $lblmap{$lbl};
         }
 
-        if ($usebuf) {
-            push @buffer, "$lbl:";
-        } else {
-            print "$lbl:\n";
-        }
+        emit_line "$lbl:";
         next;
     }
 
@@ -83,14 +182,14 @@ while (<>) {
         for my $i (0 .. $cnt - 1) {
             my $dst = $operands[$i];
             $nextvar += 8;
-            $varmap{$dst} = "qword [rbp - $nextvar]";
-            push @buffer, "  mov $varmap{$dst}, $regparams[$i]";
+            $varmap{$dst} = wrap_mem wrap_reg("rbp"), -$nextvar;
+            emit_instr "mov", $varmap{$dst}, wrap_reg $regparams[$i];
         }
 
         my $offset = 8; # 8 (not 0) because we push rbp at prologue
         for my $i ($cnt .. $#operands) {
             $offset += 8;
-            $varmap{$operands[$i]} = "qword [rbp + $offset]";
+            $varmap{$operands[$i]} = wrap_mem wrap_reg("rbp"), $offset;
         }
         next;
     }
@@ -103,8 +202,8 @@ while (<>) {
         $nextvar = $align * ceil($nextvar / $align) if $align;
 
         # Emit the prologue
-        print "  push rbp\n";
-        print "  sub rsp, $nextvar\n" if $nextvar;
+        emit_instr "push", wrap_reg "rbp";
+        emit_instr "sub", wrap_reg("rsp"), wrap_imm($nextvar) if $nextvar;
 
         # Spit out the buffer!
         for my $el (@buffer) {
@@ -113,11 +212,11 @@ while (<>) {
 
         # Emit the epilogue
         if ($nextvar) {
-            print "  leave\n";
+            emit_instr "leave";
         } else {
-            print "  pop rbp\n";
+            emit_instr "pop", wrap_reg "rbp";
         }
-        print "  ret\n";
+        emit_instr "ret";
         next;
     }
 
@@ -125,13 +224,14 @@ while (<>) {
 
     for my $i ($slot + 1 .. $#operands) {
         my $opr = $operands[$i];
+        $operands[$i] = wrap_imm($opr) if $opr =~ /^\d/;
         $operands[$i] = $varmap{$opr} if exists $varmap{$opr};
         $operands[$i] = $lblmap{$opr} if exists $lblmap{$opr};
 
         if ($opr =~ /^::/) {
             # Drop the :: prefix
             $opr =~ s/^:://;
-            $opr = "qword [rel $opr]";
+            $opr = wrap_rel $opr;
             $operands[$i] = $opr;
         }
     }
@@ -141,14 +241,14 @@ while (<>) {
         if ($dst =~ /^::/) {
             # Drop the :: prefix
             $dst =~ s/^:://;
-            $dst = "qword [rel $dst]";
+            $dst = wrap_reg $dst;
         } elsif ($op =~ /^br/) {
             $lblmap{$dst} = ".L" . $nextlbl++ unless exists $lblmap{$dst};
             $dst = $lblmap{$dst};
         } else {
             unless (exists $varmap{$dst}) {
                 $nextvar += 8;
-                $varmap{$dst} = "qword [rbp - $nextvar]";
+                $varmap{$dst} = wrap_mem wrap_reg("rbp"), -$nextvar;
             }
             $dst = $varmap{$dst};
         }
@@ -158,125 +258,106 @@ while (<>) {
 
     # Convert these to real x86-64 instructions or nasm directives:
     if ($op eq ".emit") {
-        $op = "dq";
+        emit_data 64, $operands[0];
     } elsif ($op eq "not") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  test rdx, rdx";
-        push @buffer, "  sete al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "test", wrap_reg("rdx"), wrap_reg("rdx");
+        emit_instr "sete", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "cmp") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  mov rcx, 1";
-        push @buffer, "  test rdx, rdx";
-        push @buffer, "  setne al";
-        push @buffer, "  neg rax";
-        push @buffer, "  test rdx, rdx";
-        push @buffer, "  cmovg rax, rcx";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "mov", wrap_reg("rcx"), wrap_imm(1);
+        emit_instr "test", wrap_reg("rdx"), wrap_reg("rdx");
+        emit_instr "setne", wrap_reg("al");
+        emit_instr "neg", wrap_reg("rax");
+        emit_instr "test", wrap_reg("rdx"), wrap_reg("rdx");
+        emit_instr "cmovg", wrap_reg("rax"), wrap_reg("rcx");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "ret") {
-        $op = "mov";
-        @operands = ("rax", $operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[0];
     } elsif ($op eq "mov") {
         # Add an explicit move because memory to memory move does not exist.
-        push @buffer, "  mov rax, $operands[1]";
-        $operands[1] = "rax";
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "brz") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  test rax, rax";
-        $op = "jz";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "test", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "jz", $operands[0];
     } elsif ($op eq "brnz") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  test rax, rax";
-        $op = "jnz";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "test", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "jnz", $operands[0];
     } elsif ($op eq "brlt") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "jl";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "jl", $operands[0];
     } elsif ($op eq "brgt") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "jg";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "jg", $operands[0];
     } elsif ($op eq "breq") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "je";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "je", $operands[0];
     } elsif ($op eq "brne") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "jne";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "jne", $operands[0];
     } elsif ($op eq "brge") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "jge";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "jge", $operands[0];
     } elsif ($op eq "brle") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cmp rax, $operands[2]";
-        $op = "jle";
-        @operands = ($operands[0]);
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cmp", wrap_reg("rax"), $operands[2];
+        emit_instr "jle", $operands[0];
     } elsif ($op eq "br") {
-        $op = "jmp";
+        emit_instr "jmp", $operands[0];
     } elsif ($op eq "lt") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  cmp rdx, $operands[2]";
-        push @buffer, "  setl al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "cmp", wrap_reg("rdx"), $operands[2];
+        emit_instr "setl", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "gt") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  cmp rdx, $operands[2]";
-        push @buffer, "  setg al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "cmp", wrap_reg("rdx"), $operands[2];
+        emit_instr "setg", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "eq") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  cmp rdx, $operands[2]";
-        push @buffer, "  sete al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "cmp", wrap_reg("rdx"), $operands[2];
+        emit_instr "sete", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "ne") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  cmp rdx, $operands[2]";
-        push @buffer, "  setne al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "cmp", wrap_reg("rdx"), $operands[2];
+        emit_instr "setne", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "le" or $op eq "ge") {
-        push @buffer, "  xor rax, rax";
-        push @buffer, "  mov rdx, $operands[1]";
-        push @buffer, "  cmp rdx, $operands[2]";
-        push @buffer, "  set$op al";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "xor", wrap_reg("rax"), wrap_reg("rax");
+        emit_instr "mov", wrap_reg("rdx"), $operands[1];
+        emit_instr "cmp", wrap_reg("rdx"), $operands[2];
+        emit_instr "set$op", wrap_reg("al");
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "add" or $op eq "sub") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  $op rax, $operands[2]";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "$op", wrap_reg("rax"), $operands[2];
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "mul") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  imul rax, $operands[2]";
-        $op = "mov";
-        @operands = ($operands[0], "rax");
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "imul", wrap_reg("rax"), $operands[2];
+        emit_instr "mov", $operands[0], wrap_reg("rax");
     } elsif ($op eq "div" or $op eq "rem") {
-        push @buffer, "  mov rax, $operands[1]";
-        push @buffer, "  cqo";
-        push @buffer, "  idiv $operands[2]";
-        $op = "mov";
-        @operands = ($operands[0], $op eq "div" ? "rax" : "rdx");
+        emit_instr "mov", wrap_reg("rax"), $operands[1];
+        emit_instr "cqo";
+        emit_instr "idiv", $operands[2];
+        emit_instr "mov", $operands[0], wrap_reg($op eq "div" ? "rax" : "rdx");
     } elsif ($op eq "mod") {
         # Pseudo code: (Also maybe we should generate this at IR level?)
         # let num = *operand[1]
@@ -289,22 +370,21 @@ while (<>) {
 
         my $site = ".L" . $nextlbl++;
 
-        push @buffer, "  mov r8, $operands[1]";
-        push @buffer, "  mov rcx, $operands[2]";
-        push @buffer, "  mov rax, r8";
-        push @buffer, "  cqo";
-        push @buffer, "  idiv rcx";
-        push @buffer, "  test rdx, rdx";
-        push @buffer, "  je $site";
-        push @buffer, "  test r8, r8";
-        push @buffer, "  setle al";
-        push @buffer, "  test rcx, rcx";
-        push @buffer, "  setg r8b";
-        push @buffer, "  cmp al, r8b";
-        push @buffer, "  cmove rdx, rcx";
-        push @buffer, "$site:";
-        $op = "mov";
-        @operands = ($operands[0], "rdx");
+        emit_instr "mov", wrap_reg("r8"), $operands[1];
+        emit_instr "mov", wrap_reg("rcx"), $operands[2];
+        emit_instr "mov", wrap_reg("rax"), wrap_reg("r8");
+        emit_instr "cqo";
+        emit_instr "idiv", wrap_reg("rcx");
+        emit_instr "test", wrap_reg("rdx"), wrap_reg("rdx");
+        emit_instr "je", $site;
+        emit_instr "test", wrap_reg("r8"), wrap_reg("r8");
+        emit_instr "setle", wrap_reg("al");
+        emit_instr "test", wrap_reg("rcx"), wrap_reg("rcx");
+        emit_instr "setg", wrap_reg("r8b");
+        emit_instr "cmp", wrap_reg("al"), wrap_reg("r8b");
+        emit_instr "cmove", wrap_reg("rdx"), wrap_reg("rcx");
+        emit_line "$site:";
+        emit_instr "mov", $operands[0], wrap_reg("rdx");
     } elsif ($op eq 'call') {
         my $dst = shift @operands;
         my $site = shift @operands;
@@ -314,25 +394,20 @@ while (<>) {
         my $restore = 0;
         for (; $i >= scalar @regparams; --$i) {
             $restore += 8;
-            push @buffer, "  push $operands[$i]";
+            emit_instr "push", $operands[$i];
         }
         for (; $i >= 0; --$i) {
-            push @buffer, "  mov $regparams[$i], $operands[$i]";
+            emit_instr "mov", wrap_reg($regparams[$i]), $operands[$i];
         }
 
         # Stack needs to be aligned before a call
         $align = 16;
-        push @buffer, "  call $site";
-        push @buffer, "  add rsp, $restore" if $restore;
+        emit_instr "call", $site;
+        emit_instr "add", wrap_reg("rsp"), wrap_imm($restore) if $restore;
 
         # Return value is passed through rax
-        $op = "mov";
-        @operands = ($dst, "rax");
-    }
-
-    if ($usebuf) {
-        push @buffer, "  $op " . (join ", ", @operands);
+        emit_instr "mov", $dst, wrap_reg("rax");
     } else {
-        print "  $op ", (join ", ", @operands), "\n";
+        emit_comment "Warning: Unkown $op @operands";
     }
 }
