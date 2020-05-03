@@ -136,7 +136,10 @@ sub wrap_mem {
 sub wrap_rel {
     my $base = $_[0];
     return "[rel $base]" if $format eq "nasm";
-    return "$base(\%rip)" if $format eq "gas";
+    if ($format eq "gas") {
+        return "($base)(\%rip)" if ($base =~ /^\$/);
+        return "$base(\%rip)";
+    }
 
     die "Unsupported output format: $format\n";
 }
