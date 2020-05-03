@@ -402,7 +402,8 @@ while (<>) {
 
         # Stack needs to be aligned before a call
         $align = 16;
-        emit_instr "call", $site;
+        emit_instr "lea", wrap_reg("rax"), $site;
+        emit_instr "call", wrap_reg("rax");
         emit_instr "add", wrap_reg("rsp"), wrap_imm($restore) if $restore;
 
         # Return value is passed through rax
